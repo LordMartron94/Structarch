@@ -166,6 +166,96 @@ func walkPre[TNode any, TNodeID comparable](
 }
 
 // =============================================================
+// WALK WITH INHERITED CONTEXT
+// =============================================================
+
+/*
+WalkCallbackWithContext is invoked when a node is visited during a context-carrying walk.
+
+Return values:
+
+	childCtx:
+	  context to pass to this node's children (inherited down the tree)
+
+	skipSubtree:
+	  when true, the node's children are not traversed
+
+	stopWalk:
+	  when true, the entire walk terminates immediately
+
+Context flows top-down: the callback receives the parent's context and returns the context
+for its children. Only pre-order traversal is defined for context walks.
+*/
+type WalkCallbackWithContext[TNode any, TContext any] func(
+	node TNode,
+	ctx TContext,
+) (childCtx TContext, skipSubtree, stopWalk bool)
+
+/*
+WalkConfigWithContext defines the structural accessors and behavior for a walk that carries
+inherited context. Strategy must be WALK_STRATEGY_PRE; context flows from root to children.
+*/
+type WalkConfigWithContext[TNode any, TNodeID comparable, TContext any] struct {
+	ID       func(node TNode) TNodeID
+	Children func(node TNode) []TNode
+	Callback WalkCallbackWithContext[TNode, TContext]
+}
+
+/*
+StructArchWalkWithContext traverses a structural hierarchy in pre-order, passing inherited
+context from each node to its children. Cycle-safe; supports subtree pruning and early
+termination. Use when traversal logic depends on context accumulated from ancestors
+(e.g. recovery token sets, repeat nesting).
+*/
+func StructArchWalkWithContext[TNode any, TNodeID comparable, TContext any](
+	config WalkConfigWithContext[TNode, TNodeID, TContext],
+	rootNode TNode,
+	initialContext TContext,
+) error {
+	if config.ID == nil {
+		return fmt.Errorf("walk with context requires an ID function")
+	}
+	if config.Children == nil {
+		return fmt.Errorf("walk with context requires a children collection function")
+	}
+	if config.Callback == nil {
+		return fmt.Errorf("walk with context requires a callback function")
+	}
+
+	visited := make(map[TNodeID]struct{})
+	walkPreWithContext(rootNode, initialContext, config, visited)
+	return nil
+}
+
+func walkPreWithContext[TNode any, TNodeID comparable, TContext any](
+	node TNode,
+	ctx TContext,
+	config WalkConfigWithContext[TNode, TNodeID, TContext],
+	visited map[TNodeID]struct{},
+) bool {
+	id := config.ID(node)
+	if _, seen := visited[id]; seen {
+		return false
+	}
+	visited[id] = struct{}{}
+
+	childCtx, skipChildren, stop := config.Callback(node, ctx)
+	if stop {
+		return true
+	}
+	if skipChildren {
+		return false
+	}
+
+	for _, child := range config.Children(node) {
+		if walkPreWithContext(child, childCtx, config, visited) {
+			return true
+		}
+	}
+	return false
+}
+
+// =============================================================
 // POST-ORDER WALK (BOTTOM-UP)
 // =============================================================
 
