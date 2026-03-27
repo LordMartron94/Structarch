@@ -3,25 +3,9 @@ package structarch
 import "fmt"
 
 // =============================================================
-// WALK STRATEGY
+// WALK STRATEGY & CALLBACKS
 // =============================================================
 
-/*
-StructArchWalkStrategy defines the structural traversal order.
-
-Traversal semantics:
-
-	WALK_STRATEGY_PRE:
-	  - visit node before its children (top-down)
-
-	WALK_STRATEGY_POST:
-	  - visit node after its children (bottom-up)
-
-	WALK_STRATEGY_BREADTH:
-	  - visit nodes level-by-level (breadth-first)
-
-All strategies are cycle-safe and support pruning and early termination.
-*/
 type StructArchWalkStrategy int
 
 const (
@@ -30,61 +14,95 @@ const (
 	WALK_STRATEGY_BREADTH
 )
 
-// =============================================================
-// CALLBACK
-// =============================================================
-
 /*
-WalkCallback is invoked when a node is visited.
+WalkCallback is invoked for each visited node during StructArchWalk.
 
 Return values:
-
-	skipProcessingNode:
-	  - when true, the node's children are not traversed
-
-	stopProcessing:
-	  - when true, the entire walk terminates immediately
-
-skipProcessingNode only affects subtree traversal.
-stopProcessing halts the walk globally.
+- skipProcessingNode: when true, the current node's subtree is skipped
+- stopProcessing: when true, traversal stops immediately
 */
 type WalkCallback[TNode any] func(
 	node TNode,
 ) (skipProcessingNode, stopProcessing bool)
 
+/*
+WalkCallbackWithContext is invoked for each visited node during StructArchWalkWithContext.
+
+Return values:
+- childCtx: context value propagated to children of this node
+- skipSubtree: when true, children are not visited
+- stopWalk: when true, traversal stops immediately
+*/
+type WalkCallbackWithContext[TNode any, TContext any] func(
+	node TNode,
+	ctx TContext,
+) (childCtx TContext, skipSubtree, stopWalk bool)
+
 // =============================================================
-// WALK CONFIGURATION
+// WALK CONFIGURATION & SCRATCHPADS
 // =============================================================
 
 /*
-WalkConfig defines the structural accessors and behavior for a walk.
+WalkConfig defines traversal configuration for StructArchWalk.
 
-Required fields:
-
-	ID:
-	  returns a stable unique identifier for a node
-	  used for cycle detection and performance
-
-	Children:
-	  returns the direct child nodes of a node
-
-	Callback:
-	  invoked during traversal
-
-Optional fields:
-
-	Parent:
-	  provided for future extensions (upward traversal, queries, etc.)
+ChildrenInto must append the current node's children into out and return the resulting
+slice. The walker reuses one scratch child buffer across nodes to avoid per-node
+allocations in hot traversal paths.
 */
 type WalkConfig[TNode any, TNodeID comparable] struct {
-	Strategy StructArchWalkStrategy
+	Strategy     StructArchWalkStrategy
+	Callback     WalkCallback[TNode]
+	ID           func(node TNode) TNodeID
+	ChildrenInto func(node TNode, out []TNode) []TNode
+	Parent       func(node TNode) TNode
+	Scratch      *WalkScratch[TNode, TNodeID]
+}
 
-	Callback WalkCallback[TNode]
+/*
+WalkScratch stores reusable memory for StructArchWalk.
 
-	ID func(node TNode) TNodeID
+Reuse this across repeated walks to reduce allocations.
+*/
+type WalkScratch[TNode any, TNodeID comparable] struct {
+	Visited  map[TNodeID]struct{}
+	Stack    []walkFrame[TNode]
+	Queue    []TNode
+	ChildBuf []TNode
+}
 
-	Children func(node TNode) []TNode
-	Parent   func(node TNode) TNode
+type walkFrame[TNode any] struct {
+	Node  TNode
+	Phase uint8
+}
+
+/*
+WalkConfigWithContext defines traversal configuration for StructArchWalkWithContext.
+
+ChildrenInto must append the current node's children into out and return the resulting
+slice. The walker reuses one scratch child buffer across nodes to avoid per-node
+allocations in hot traversal paths.
+*/
+type WalkConfigWithContext[TNode any, TNodeID comparable, TContext any] struct {
+	ID           func(node TNode) TNodeID
+	ChildrenInto func(node TNode, out []TNode) []TNode
+	Callback     WalkCallbackWithContext[TNode, TContext]
+	Scratch      *WalkContextScratch[TNode, TNodeID, TContext]
+}
+
+/*
+WalkContextScratch stores reusable memory for StructArchWalkWithContext.
+
+Reuse this across repeated walks to reduce allocations.
+*/
+type WalkContextScratch[TNode any, TNodeID comparable, TContext any] struct {
+	Visited  map[TNodeID]struct{}
+	Stack    []ctxFrame[TNode, TContext]
+	ChildBuf []TNode
+}
+
+type ctxFrame[TNode any, TContext any] struct {
+	Node TNode
+	Ctx  TContext
 }
 
 // =============================================================
@@ -92,39 +110,28 @@ type WalkConfig[TNode any, TNodeID comparable] struct {
 // =============================================================
 
 /*
-StructArchWalk traverses a structural hierarchy starting at rootNode.
+StructArchWalk traverses a structure using the configured strategy.
 
-Traversal is:
-
-  - cycle-safe
-  - supports subtree pruning
-  - supports early termination
-
-It works for trees, DAGs, and general node graphs.
+The walk is cycle-safe by ID, supports subtree pruning and early stop signals, and uses
+the caller-provided ChildrenInto collector to avoid per-node child-slice allocations.
 */
 func StructArchWalk[TNode any, TNodeID comparable](
 	config WalkConfig[TNode, TNodeID],
 	rootNode TNode,
 ) error {
-	if config.ID == nil {
-		return fmt.Errorf("walk requires an ID function")
-	}
-	if config.Children == nil {
-		return fmt.Errorf("walk requires a children collection function")
-	}
-	if config.Callback == nil {
-		return fmt.Errorf("walk requires a callback function")
+	if err := validateBasicConfig(config); err != nil {
+		return err
 	}
 
-	visited := make(map[TNodeID]struct{})
+	scratch := prepareBasicScratch(config.Scratch)
 
 	switch config.Strategy {
 	case WALK_STRATEGY_PRE:
-		walkPre(rootNode, config, visited)
+		walkPre(rootNode, config, scratch)
 	case WALK_STRATEGY_POST:
-		walkPost(rootNode, config, visited)
+		walkPost(rootNode, config, scratch)
 	case WALK_STRATEGY_BREADTH:
-		walkBreadth(rootNode, config, visited)
+		walkBreadth(rootNode, config, scratch)
 	default:
 		return fmt.Errorf("unknown walk strategy")
 	}
@@ -132,114 +139,60 @@ func StructArchWalk[TNode any, TNodeID comparable](
 	return nil
 }
 
-// =============================================================
-// PRE-ORDER WALK (TOP-DOWN)
-// =============================================================
-
-func walkPre[TNode any, TNodeID comparable](
-	node TNode,
-	config WalkConfig[TNode, TNodeID],
-	visited map[TNodeID]struct{},
-) bool {
-	id := config.ID(node)
-	if _, seen := visited[id]; seen {
-		return false
-	}
-	visited[id] = struct{}{}
-
-	skipChildren, stop := config.Callback(node)
-	if stop {
-		return true
-	}
-
-	if skipChildren {
-		return false
-	}
-
-	for _, child := range config.Children(node) {
-		if walkPre(child, config, visited) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// =============================================================
-// WALK WITH INHERITED CONTEXT
-// =============================================================
-
 /*
-WalkCallbackWithContext is invoked when a node is visited during a context-carrying walk.
+StructArchWalkWithContext traverses a structure in pre-order while propagating context.
 
-Return values:
-
-	childCtx:
-	  context to pass to this node's children (inherited down the tree)
-
-	skipSubtree:
-	  when true, the node's children are not traversed
-
-	stopWalk:
-	  when true, the entire walk terminates immediately
-
-Context flows top-down: the callback receives the parent's context and returns the context
-for its children. Only pre-order traversal is defined for context walks.
-*/
-type WalkCallbackWithContext[TNode any, TContext any] func(
-	node TNode,
-	ctx TContext,
-) (childCtx TContext, skipSubtree, stopWalk bool)
-
-/*
-WalkConfigWithContext defines the structural accessors and behavior for a walk that carries
-inherited context. Strategy must be WALK_STRATEGY_PRE; context flows from root to children.
-*/
-type WalkConfigWithContext[TNode any, TNodeID comparable, TContext any] struct {
-	ID       func(node TNode) TNodeID
-	Children func(node TNode) []TNode
-	Callback WalkCallbackWithContext[TNode, TContext]
-}
-
-/*
-StructArchWalkWithContext traverses a structural hierarchy in pre-order, passing inherited
-context from each node to its children. Cycle-safe; supports subtree pruning and early
-termination. Use when traversal logic depends on context accumulated from ancestors
-(e.g. recovery token sets, repeat nesting).
+The callback returns the context for children, plus subtree-prune and early-stop flags.
+Traversal is cycle-safe by ID and uses ChildrenInto with reusable scratch memory.
 */
 func StructArchWalkWithContext[TNode any, TNodeID comparable, TContext any](
 	config WalkConfigWithContext[TNode, TNodeID, TContext],
 	rootNode TNode,
 	initialContext TContext,
 ) error {
-	if config.ID == nil {
-		return fmt.Errorf("walk with context requires an ID function")
+	if config.ID == nil || config.Callback == nil {
+		return fmt.Errorf("walk with context requires ID and Callback functions")
 	}
-	if config.Children == nil {
-		return fmt.Errorf("walk with context requires a children collection function")
-	}
-	if config.Callback == nil {
-		return fmt.Errorf("walk with context requires a callback function")
+	if config.ChildrenInto == nil {
+		return fmt.Errorf("walk with context requires ChildrenInto")
 	}
 
-	visited := make(map[TNodeID]struct{})
-	walkPreWithContext(rootNode, initialContext, config, visited)
+	scratch := prepareContextScratch(config.Scratch)
+	walkPreWithContext(rootNode, initialContext, config, scratch)
 	return nil
 }
 
-func walkPreWithContext[TNode any, TNodeID comparable, TContext any](
-	node TNode,
-	ctx TContext,
-	config WalkConfigWithContext[TNode, TNodeID, TContext],
-	visited map[TNodeID]struct{},
+// =============================================================
+// CORE WALK IMPLEMENTATIONS
+// =============================================================
+
+func walkPre[TNode any, TNodeID comparable](
+	root TNode,
+	config WalkConfig[TNode, TNodeID],
+	scratch *WalkScratch[TNode, TNodeID],
+) {
+	scratch.Stack = append(scratch.Stack, walkFrame[TNode]{Node: root})
+
+	for len(scratch.Stack) > 0 {
+		if processPreNode(config, scratch) {
+			return
+		}
+	}
+}
+
+func processPreNode[TNode any, TNodeID comparable](
+	config WalkConfig[TNode, TNodeID],
+	scratch *WalkScratch[TNode, TNodeID],
 ) bool {
-	id := config.ID(node)
-	if _, seen := visited[id]; seen {
+	topIdx := len(scratch.Stack) - 1
+	frame := scratch.Stack[topIdx]
+	scratch.Stack = scratch.Stack[:topIdx]
+
+	if markVisited(config.ID, frame.Node, scratch.Visited) {
 		return false
 	}
-	visited[id] = struct{}{}
 
-	childCtx, skipChildren, stop := config.Callback(node, ctx)
+	skipChildren, stop := config.Callback(frame.Node)
 	if stop {
 		return true
 	}
@@ -247,72 +200,198 @@ func walkPreWithContext[TNode any, TNodeID comparable, TContext any](
 		return false
 	}
 
-	for _, child := range config.Children(node) {
-		if walkPreWithContext(child, childCtx, config, visited) {
-			return true
+	scratch.ChildBuf = config.ChildrenInto(frame.Node, scratch.ChildBuf[:0])
+	pushChildrenToStack(scratch.ChildBuf, &scratch.Stack, 0)
+	return false
+}
+
+func walkPost[TNode any, TNodeID comparable](
+	root TNode,
+	config WalkConfig[TNode, TNodeID],
+	scratch *WalkScratch[TNode, TNodeID],
+) {
+	scratch.Stack = append(scratch.Stack, walkFrame[TNode]{Node: root, Phase: 0})
+
+	for len(scratch.Stack) > 0 {
+		if processPostNode(config, scratch) {
+			return
 		}
+	}
+}
+
+func processPostNode[TNode any, TNodeID comparable](
+	config WalkConfig[TNode, TNodeID],
+	scratch *WalkScratch[TNode, TNodeID],
+) bool {
+	topIdx := len(scratch.Stack) - 1
+	frame := scratch.Stack[topIdx]
+	scratch.Stack = scratch.Stack[:topIdx]
+
+	if frame.Phase == 1 {
+		_, stop := config.Callback(frame.Node)
+		return stop
+	}
+
+	if markVisited(config.ID, frame.Node, scratch.Visited) {
+		return false
+	}
+
+	scratch.Stack = append(scratch.Stack, walkFrame[TNode]{Node: frame.Node, Phase: 1})
+	scratch.ChildBuf = config.ChildrenInto(frame.Node, scratch.ChildBuf[:0])
+	pushChildrenToStack(scratch.ChildBuf, &scratch.Stack, 0)
+	return false
+}
+
+func walkBreadth[TNode any, TNodeID comparable](
+	root TNode,
+	config WalkConfig[TNode, TNodeID],
+	scratch *WalkScratch[TNode, TNodeID],
+) {
+	scratch.Queue = append(scratch.Queue, root)
+
+	for len(scratch.Queue) > 0 {
+		if processBreadthNode(config, scratch) {
+			break
+		}
+	}
+
+	// Prevent memory leak by clearing references in the underlying array
+	scratch.Queue = scratch.Queue[:0]
+}
+
+func processBreadthNode[TNode any, TNodeID comparable](
+	config WalkConfig[TNode, TNodeID],
+	scratch *WalkScratch[TNode, TNodeID],
+) bool {
+	node := scratch.Queue[0]
+	scratch.Queue = scratch.Queue[1:]
+
+	if markVisited(config.ID, node, scratch.Visited) {
+		return false
+	}
+
+	skipChildren, stop := config.Callback(node)
+	if stop {
+		return true
+	}
+	if skipChildren {
+		return false
+	}
+
+	scratch.ChildBuf = config.ChildrenInto(node, scratch.ChildBuf[:0])
+	scratch.Queue = append(scratch.Queue, scratch.ChildBuf...)
+	return false
+}
+
+func walkPreWithContext[TNode any, TNodeID comparable, TContext any](
+	root TNode,
+	initialCtx TContext,
+	config WalkConfigWithContext[TNode, TNodeID, TContext],
+	scratch *WalkContextScratch[TNode, TNodeID, TContext],
+) {
+	scratch.Stack = append(scratch.Stack, ctxFrame[TNode, TContext]{Node: root, Ctx: initialCtx})
+
+	for len(scratch.Stack) > 0 {
+		if processContextNode(config, scratch) {
+			return
+		}
+	}
+}
+
+func processContextNode[TNode any, TNodeID comparable, TContext any](
+	config WalkConfigWithContext[TNode, TNodeID, TContext],
+	scratch *WalkContextScratch[TNode, TNodeID, TContext],
+) bool {
+	topIdx := len(scratch.Stack) - 1
+	frame := scratch.Stack[topIdx]
+	scratch.Stack = scratch.Stack[:topIdx]
+
+	if markVisited(config.ID, frame.Node, scratch.Visited) {
+		return false
+	}
+
+	childCtx, skipChildren, stop := config.Callback(frame.Node, frame.Ctx)
+	if stop {
+		return true
+	}
+	if skipChildren {
+		return false
+	}
+
+	scratch.ChildBuf = config.ChildrenInto(frame.Node, scratch.ChildBuf[:0])
+	for i := len(scratch.ChildBuf) - 1; i >= 0; i-- {
+		scratch.Stack = append(scratch.Stack, ctxFrame[TNode, TContext]{
+			Node: scratch.ChildBuf[i],
+			Ctx:  childCtx,
+		})
 	}
 	return false
 }
 
 // =============================================================
-// POST-ORDER WALK (BOTTOM-UP)
+// HELPER METHODS
 // =============================================================
 
-func walkPost[TNode any, TNodeID comparable](
-	node TNode,
-	config WalkConfig[TNode, TNodeID],
-	visited map[TNodeID]struct{},
-) bool {
-	id := config.ID(node)
-	if _, seen := visited[id]; seen {
-		return false
+func validateBasicConfig[TNode any, TNodeID comparable](config WalkConfig[TNode, TNodeID]) error {
+	if config.ID == nil || config.Callback == nil {
+		return fmt.Errorf("walk requires ID and Callback functions")
 	}
-	visited[id] = struct{}{}
-
-	for _, child := range config.Children(node) {
-		if walkPost(child, config, visited) {
-			return true
-		}
+	if config.ChildrenInto == nil {
+		return fmt.Errorf("walk requires ChildrenInto")
 	}
-
-	_, stop := config.Callback(node)
-	return stop
+	return nil
 }
 
-// =============================================================
-// BREADTH-FIRST WALK
-// =============================================================
+func prepareBasicScratch[TNode any, TNodeID comparable](
+	provided *WalkScratch[TNode, TNodeID],
+) *WalkScratch[TNode, TNodeID] {
+	if provided == nil {
+		provided = &WalkScratch[TNode, TNodeID]{}
+	}
+	if provided.Visited == nil {
+		provided.Visited = make(map[TNodeID]struct{})
+	} else {
+		clear(provided.Visited)
+	}
+	provided.Stack = provided.Stack[:0]
+	provided.Queue = provided.Queue[:0]
+	return provided
+}
 
-func walkBreadth[TNode any, TNodeID comparable](
-	root TNode,
-	config WalkConfig[TNode, TNodeID],
+func prepareContextScratch[TNode any, TNodeID comparable, TContext any](
+	provided *WalkContextScratch[TNode, TNodeID, TContext],
+) *WalkContextScratch[TNode, TNodeID, TContext] {
+	if provided == nil {
+		provided = &WalkContextScratch[TNode, TNodeID, TContext]{}
+	}
+	if provided.Visited == nil {
+		provided.Visited = make(map[TNodeID]struct{})
+	} else {
+		clear(provided.Visited)
+	}
+	provided.Stack = provided.Stack[:0]
+	return provided
+}
+
+func markVisited[TNode any, TNodeID comparable](
+	idFn func(TNode) TNodeID,
+	node TNode,
 	visited map[TNodeID]struct{},
+) bool {
+	id := idFn(node)
+	if _, seen := visited[id]; seen {
+		return true
+	}
+	visited[id] = struct{}{}
+	return false
+}
+
+func pushChildrenToStack[TNode any](
+	children []TNode,
+	stack *[]walkFrame[TNode],
+	phase uint8,
 ) {
-	queue := []TNode{root}
-
-	for len(queue) > 0 {
-		node := queue[0]
-		queue = queue[1:]
-
-		id := config.ID(node)
-		if _, seen := visited[id]; seen {
-			continue
-		}
-		visited[id] = struct{}{}
-
-		skipChildren, stop := config.Callback(node)
-		if stop {
-			return
-		}
-
-		if skipChildren {
-			continue
-		}
-
-		children := config.Children(node)
-		if len(children) > 0 {
-			queue = append(queue, children...)
-		}
+	for i := len(children) - 1; i >= 0; i-- {
+		*stack = append(*stack, walkFrame[TNode]{Node: children[i], Phase: phase})
 	}
 }
