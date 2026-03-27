@@ -83,8 +83,22 @@ type WalkConfig[TNode any, TNodeID comparable] struct {
 
 	ID func(node TNode) TNodeID
 
-	Children func(node TNode) []TNode
-	Parent   func(node TNode) TNode
+	Children     func(node TNode) []TNode
+	ChildrenInto func(node TNode, out []TNode) []TNode
+	Parent       func(node TNode) TNode
+	Scratch      *WalkScratch[TNode, TNodeID]
+}
+
+type WalkScratch[TNode any, TNodeID comparable] struct {
+	Visited map[TNodeID]struct{}
+	Stack   []walkFrame[TNode]
+	Queue   []TNode
+}
+
+type walkFrame[TNode any] struct {
+	Node       TNode
+	Phase      uint8
+	SkipChilds bool
 }
 
 // =============================================================
@@ -109,22 +123,34 @@ func StructArchWalk[TNode any, TNodeID comparable](
 	if config.ID == nil {
 		return fmt.Errorf("walk requires an ID function")
 	}
-	if config.Children == nil {
+	if config.Children == nil && config.ChildrenInto == nil {
 		return fmt.Errorf("walk requires a children collection function")
 	}
 	if config.Callback == nil {
 		return fmt.Errorf("walk requires a callback function")
 	}
 
-	visited := make(map[TNodeID]struct{})
+	scratch := config.Scratch
+	if scratch == nil {
+		scratch = &WalkScratch[TNode, TNodeID]{}
+	}
+
+	if scratch.Visited == nil {
+		scratch.Visited = make(map[TNodeID]struct{})
+	}
+	for k := range scratch.Visited {
+		delete(scratch.Visited, k)
+	}
+	scratch.Stack = scratch.Stack[:0]
+	scratch.Queue = scratch.Queue[:0]
 
 	switch config.Strategy {
 	case WALK_STRATEGY_PRE:
-		walkPre(rootNode, config, visited)
+		walkPre(rootNode, config, scratch)
 	case WALK_STRATEGY_POST:
-		walkPost(rootNode, config, visited)
+		walkPost(rootNode, config, scratch)
 	case WALK_STRATEGY_BREADTH:
-		walkBreadth(rootNode, config, visited)
+		walkBreadth(rootNode, config, scratch)
 	default:
 		return fmt.Errorf("unknown walk strategy")
 	}
@@ -137,28 +163,97 @@ func StructArchWalk[TNode any, TNodeID comparable](
 // =============================================================
 
 func walkPre[TNode any, TNodeID comparable](
-	node TNode,
+	root TNode,
 	config WalkConfig[TNode, TNodeID],
+	scratch *WalkScratch[TNode, TNodeID],
+) bool {
+	stack := append(scratch.Stack, walkFrame[TNode]{Node: root, Phase: 0})
+	buf := make([]TNode, 0, 8)
+
+	for len(stack) > 0 {
+		topIdx := len(stack) - 1
+		frame := stack[topIdx]
+		stack = stack[:topIdx]
+
+		if frame.Phase == 0 {
+			id := config.ID(frame.Node)
+			if _, seen := scratch.Visited[id]; seen {
+				continue
+			}
+			scratch.Visited[id] = struct{}{}
+
+			skipChildren, stop := config.Callback(frame.Node)
+			if stop {
+				scratch.Stack = stack
+				return true
+			}
+			if skipChildren {
+				continue
+			}
+
+			children := walkChildrenCollect(config, frame.Node, buf[:0])
+			buf = children[:0]
+			for i := len(children) - 1; i >= 0; i-- {
+				stack = append(stack, walkFrame[TNode]{Node: children[i], Phase: 0})
+			}
+		}
+	}
+
+	scratch.Stack = stack
+	return false
+}
+
+func walkChildrenCollect[TNode any, TNodeID comparable](
+	config WalkConfig[TNode, TNodeID],
+	node TNode,
+	out []TNode,
+) []TNode {
+	if config.ChildrenInto != nil {
+		return config.ChildrenInto(node, out)
+	}
+	children := config.Children(node)
+	if len(children) == 0 {
+		return out
+	}
+	out = append(out, children...)
+	return out
+}
+
+func walkPreWithContext[TNode any, TNodeID comparable, TContext any](
+	root TNode,
+	initialCtx TContext,
+	config WalkConfigWithContext[TNode, TNodeID, TContext],
 	visited map[TNodeID]struct{},
 ) bool {
-	id := config.ID(node)
-	if _, seen := visited[id]; seen {
-		return false
-	}
-	visited[id] = struct{}{}
-
-	skipChildren, stop := config.Callback(node)
-	if stop {
-		return true
+	type ctxFrame struct {
+		node TNode
+		ctx  TContext
 	}
 
-	if skipChildren {
-		return false
-	}
+	stack := make([]ctxFrame, 0, 64)
+	stack = append(stack, ctxFrame{node: root, ctx: initialCtx})
 
-	for _, child := range config.Children(node) {
-		if walkPre(child, config, visited) {
+	for len(stack) > 0 {
+		top := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		id := config.ID(top.node)
+		if _, seen := visited[id]; seen {
+			continue
+		}
+		visited[id] = struct{}{}
+
+		childCtx, skipChildren, stop := config.Callback(top.node, top.ctx)
+		if stop {
 			return true
+		}
+		if skipChildren {
+			continue
+		}
+
+		children := config.Children(top.node)
+		for i := len(children) - 1; i >= 0; i-- {
+			stack = append(stack, ctxFrame{node: children[i], ctx: childCtx})
 		}
 	}
 
@@ -227,57 +322,48 @@ func StructArchWalkWithContext[TNode any, TNodeID comparable, TContext any](
 	return nil
 }
 
-func walkPreWithContext[TNode any, TNodeID comparable, TContext any](
-	node TNode,
-	ctx TContext,
-	config WalkConfigWithContext[TNode, TNodeID, TContext],
-	visited map[TNodeID]struct{},
-) bool {
-	id := config.ID(node)
-	if _, seen := visited[id]; seen {
-		return false
-	}
-	visited[id] = struct{}{}
-
-	childCtx, skipChildren, stop := config.Callback(node, ctx)
-	if stop {
-		return true
-	}
-	if skipChildren {
-		return false
-	}
-
-	for _, child := range config.Children(node) {
-		if walkPreWithContext(child, childCtx, config, visited) {
-			return true
-		}
-	}
-	return false
-}
-
 // =============================================================
 // POST-ORDER WALK (BOTTOM-UP)
 // =============================================================
 
 func walkPost[TNode any, TNodeID comparable](
-	node TNode,
+	root TNode,
 	config WalkConfig[TNode, TNodeID],
-	visited map[TNodeID]struct{},
+	scratch *WalkScratch[TNode, TNodeID],
 ) bool {
-	id := config.ID(node)
-	if _, seen := visited[id]; seen {
-		return false
-	}
-	visited[id] = struct{}{}
+	stack := append(scratch.Stack, walkFrame[TNode]{Node: root, Phase: 0})
+	buf := make([]TNode, 0, 8)
 
-	for _, child := range config.Children(node) {
-		if walkPost(child, config, visited) {
+	for len(stack) > 0 {
+		topIdx := len(stack) - 1
+		frame := stack[topIdx]
+		stack = stack[:topIdx]
+
+		if frame.Phase == 0 {
+			id := config.ID(frame.Node)
+			if _, seen := scratch.Visited[id]; seen {
+				continue
+			}
+			scratch.Visited[id] = struct{}{}
+			stack = append(stack, walkFrame[TNode]{Node: frame.Node, Phase: 1})
+
+			children := walkChildrenCollect(config, frame.Node, buf[:0])
+			buf = children[:0]
+			for i := len(children) - 1; i >= 0; i-- {
+				stack = append(stack, walkFrame[TNode]{Node: children[i], Phase: 0})
+			}
+			continue
+		}
+
+		_, stop := config.Callback(frame.Node)
+		if stop {
+			scratch.Stack = stack
 			return true
 		}
 	}
 
-	_, stop := config.Callback(node)
-	return stop
+	scratch.Stack = stack
+	return false
 }
 
 // =============================================================
@@ -287,19 +373,20 @@ func walkPost[TNode any, TNodeID comparable](
 func walkBreadth[TNode any, TNodeID comparable](
 	root TNode,
 	config WalkConfig[TNode, TNodeID],
-	visited map[TNodeID]struct{},
+	scratch *WalkScratch[TNode, TNodeID],
 ) {
-	queue := []TNode{root}
+	queue := append(scratch.Queue, root)
+	buf := make([]TNode, 0, 8)
 
 	for len(queue) > 0 {
 		node := queue[0]
 		queue = queue[1:]
 
 		id := config.ID(node)
-		if _, seen := visited[id]; seen {
+		if _, seen := scratch.Visited[id]; seen {
 			continue
 		}
-		visited[id] = struct{}{}
+		scratch.Visited[id] = struct{}{}
 
 		skipChildren, stop := config.Callback(node)
 		if stop {
@@ -310,9 +397,12 @@ func walkBreadth[TNode any, TNodeID comparable](
 			continue
 		}
 
-		children := config.Children(node)
+		children := walkChildrenCollect(config, node, buf[:0])
+		buf = children[:0]
 		if len(children) > 0 {
 			queue = append(queue, children...)
 		}
 	}
+
+	scratch.Queue = queue
 }
