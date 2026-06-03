@@ -9,6 +9,8 @@ elements to parallelizable phases from a dependency adjacency map.
 [Capabilities]
   - StructArchWalk / StructArchWalkWithContext: pre, post, and breadth walks with
     reusable scratch buffers.
-  - STRUCTARCH_DAG_Resolve: topological phase grouping with cycle detection.
+  - STRUCTARCH_DAG_Resolve: topological phase grouping with cycle detection (map adjacency).
+  - STRUCTARCH_DAG_ResolveCSR: dense CSR graph, flat execution order and phase offsets
+    via caller allocFn (memarch/memstruct); for frame graphs and manual memory pipelines.
 */
 package structarch
