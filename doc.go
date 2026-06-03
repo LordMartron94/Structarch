@@ -11,6 +11,6 @@ elements to parallelizable phases from a dependency adjacency map.
     reusable scratch buffers.
   - STRUCTARCH_DAG_Resolve: topological phase grouping with cycle detection (map adjacency).
   - STRUCTARCH_DAG_ResolveCSR: dense CSR graph, flat execution order and phase offsets
-    via caller allocFn (memarch/memstruct); for frame graphs and manual memory pipelines.
+    via caller allocFn (memarch/memstruct); for fixed-size graphs and manual-memory pipelines.
 */
 package structarch

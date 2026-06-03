@@ -34,7 +34,7 @@ PhaseOffsets is a memstruct array mark (Array[uint32]) of length PhaseCount+1:
   - PhaseOffsets[k] is the start index in ExecutionOrder for phase k.
   - PhaseOffsets[PhaseCount] equals ExecutionCount (end sentinel).
 
-The renderer may iterate ExecutionOrder linearly; consult PhaseOffsets only when inserting barriers between phases.
+Clients may iterate ExecutionOrder linearly; consult PhaseOffsets only when phase boundaries matter (for example synchronization between dependency stages).
 */
 type DagResolveCSRResult struct {
 	ExecutionOrder memcore.MarkRaw
