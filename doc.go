@@ -12,5 +12,8 @@ elements to parallelizable phases from a dependency adjacency map.
   - STRUCTARCH_DAG_Resolve: topological phase grouping with cycle detection (map adjacency).
   - STRUCTARCH_DAG_ResolveCSR: dense CSR graph, flat execution order and phase offsets
     via caller allocFn (memarch/memstruct); for fixed-size graphs and manual-memory pipelines.
+  - TaskGraphBuilder / STRUCTARCH_TaskGraph_Resolve: bipartite task–resource topology (SPLASH
+    frame-graph shape), latest-writer lowering in registration order, CSR schedule, and
+    execution-index ResourceLifetime output for aliasing.
 */
 package structarch
